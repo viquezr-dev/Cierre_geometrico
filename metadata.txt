@@ -1,0 +1,15 @@
+[general]
+name=Cierre geométrico
+qgisMinimumVersion=3.22
+description=Analyzes ordered UTM coordinates and creates an HTML report of bearings, distances, closure, elevations and polygon area.
+version=1.0.0
+author=Raúl Víquez
+email=viquezr@gmail.com
+about=Reads a QGIS coordinate table or total station CSV, validates the ordered route or polygon, and exports a topographic HTML report with an SVG drawing and downloadable CSV.
+category=Vector
+icon=icon.svg
+homepage=https://viquezr-dev.github.io/Cierre_geometrico/
+repository=https://github.com/viquezr-dev/Cierre_geometrico
+tracker=https://github.com/viquezr-dev/Cierre_geometrico/issues
+experimental=False
+deprecated=False
