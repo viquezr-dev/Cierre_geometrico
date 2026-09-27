@@ -13,7 +13,7 @@ from qgis.PyQt.QtGui import QGuiApplication, QIcon
 from qgis.PyQt.QtWidgets import (
     QAction, QComboBox, QDialog, QDialogButtonBox, QFileDialog,
     QFormLayout, QGroupBox, QLabel, QLineEdit, QMessageBox, QPushButton,
-    QCheckBox, QDoubleSpinBox, QSpinBox, QHBoxLayout, QScrollArea,
+    QHBoxLayout, QScrollArea,
     QWidget, QVBoxLayout, QTabWidget,
 )
 from qgis.core import QgsCoordinateReferenceSystem, QgsProject, QgsVectorLayer
@@ -95,6 +95,148 @@ def read_station_csv(path):
     return records
 
 
+def read_station_observations(path, allow_missing=False):
+    """Read point order and observation codes from native or labeled CSV."""
+    records = read_station_csv(path)
+    with open(path, "r", encoding="utf-8-sig", newline="") as source:
+        sample = source.read(4096)
+        source.seek(0)
+        try:
+            delimiter = csv.Sniffer().sniff(sample, delimiters=",;\t").delimiter
+        except csv.Error:
+            delimiter = ","
+        rows = [(line, [cell.strip() for cell in row])
+                for line, row in enumerate(csv.reader(source, delimiter=delimiter), 1)
+                if row and any(cell.strip() for cell in row)]
+    columns = [re.sub(r"[^A-Z0-9]", "", value.upper()) for value in rows[0][1]]
+    labeled = "OBS" in columns and "PUNTO" in columns
+    data_rows = rows[1:] if labeled else rows
+    if not labeled and (len(rows[0][1]) < 5 or not rows[0][1][0].isdigit()):
+        if allow_missing and len(rows[0][1]) < 5:
+            return []
+        raise ValueError(
+            "Varios polígonos requiere PUNTO y OBS en el encabezado, o "
+            "cinco columnas sin encabezado: punto, Este, Norte, Cota, grupo (PT/PC).")
+    if len(data_rows) != len(records):
+        raise ValueError("No coinciden las filas del grupo con las coordenadas.")
+    obs_index = columns.index("OBS") if labeled else None
+    observations = []
+    for (line, cells), record in zip(data_rows, records):
+        if labeled:
+            raw_order = cells[obs_index] if obs_index < len(cells) else None
+            group_name = None
+        else:
+            raw_order = record[0]
+            group_name = cells[4] if len(cells) > 4 else None
+        observations.append((raw_order, record[0], record[1],
+                             record[2], record[3], "Fila {}".format(line),
+                             group_name))
+    return observations
+
+
+def normalize_station_observations(observations):
+    """Validate (order/code, point, N, E, Z, location[, code]) records."""
+    ordered = []
+    used_orders = set()
+    used_ids = set()
+    for observation in observations:
+        raw_order, point_id, north, east, elevation, location = observation[:6]
+        group_name = observation[6] if len(observation) > 6 else None
+        point_id = str(point_id).strip()
+        if group_name is None:
+            try:
+                float(raw_order)
+            except (TypeError, ValueError):
+                try:
+                    float(point_id)
+                except ValueError:
+                    pass
+                else:
+                    group_name, raw_order = raw_order, point_id
+        try:
+            order = float(raw_order)
+        except (TypeError, ValueError):
+            raise ValueError("{}: el orden debe ser un número entero.".format(location))
+        if not math.isfinite(order) or order < 1 or not order.is_integer():
+            raise ValueError("{}: el orden debe ser un entero positivo.".format(location))
+        order = int(order)
+        if order in used_orders:
+            raise ValueError("{}: el número de orden {} está duplicado.".format(location, order))
+        used_orders.add(order)
+        if group_name is None:
+            match = re.fullmatch(r"([A-Za-z][A-Za-z0-9_]*)-(\d+)", point_id)
+            if match is None:
+                raise ValueError("{}: PUNTO debe tener formato PT-1 o PC-1.".format(location))
+            name = match.group(1).upper()
+        else:
+            name = str(group_name).strip().upper()
+            if not re.fullmatch(r"[A-Z][A-Z0-9_]*", name):
+                raise ValueError("{}: el grupo debe ser PT, PC u otra etiqueta válida.".format(location))
+            match = re.fullmatch(r"([A-Za-z][A-Za-z0-9_]*)-(\d+)", point_id)
+            if match and match.group(1).upper() != name:
+                raise ValueError("{}: PUNTO y grupo tienen prefijos diferentes.".format(location))
+        if point_id.upper() in used_ids:
+            raise ValueError("{}: PUNTO {} está duplicado.".format(location, point_id))
+        used_ids.add(point_id.upper())
+        try:
+            n, e = float(north), float(east)
+            z = None if elevation is None else float(elevation)
+        except (TypeError, ValueError):
+            raise ValueError("{}: Norte, Este o Cota no es numérico.".format(location))
+        if not all(math.isfinite(v) for v in (n, e) + (() if z is None else (z,))):
+            raise ValueError("{}: coordenada o cota no finita.".format(location))
+        ordered.append((order, name, (point_id, n, e, z)))
+    return sorted(ordered)
+
+
+def read_station_groups(path):
+    """Group the complete polygon blocks of a station CSV."""
+    return group_station_observations(read_station_observations(path))
+
+
+def group_station_observations(observations):
+    """Keep whole polygon groups separate in the observed point sequence."""
+    ordered = normalize_station_observations(observations)
+    for _, name, record in ordered:
+        if name not in ("PT", "PC"):
+            raise ValueError(
+                "Punto {}: OBS '{}' no coincide con el patrón PT/PC. "
+                "Edite la observación antes de calcular.".format(record[0], name))
+    groups = {}
+    completed = set()
+    previous = None
+    for _, name, record in sorted(ordered):
+        if name != previous:
+            if name in completed:
+                raise ValueError(
+                    "Punto {}: OBS '{}' reaparece fuera de su bloque PT/PC. "
+                    "Revise la secuencia antes de calcular.".format(record[0], name))
+            if previous is not None:
+                completed.add(previous)
+            previous = name
+        groups.setdefault(name, []).append(record)
+    if len(groups) < 2:
+        raise ValueError("Se requieren al menos dos grupos de polígonos para este modo.")
+    for name, group in groups.items():
+        if len(group) < 3:
+            raise ValueError("El polígono {} tiene menos de tres puntos.".format(name))
+    return groups
+
+
+def validate_code_interpretation(observations):
+    """Require one observation pattern for a single polygon."""
+    if not observations:
+        return
+    ordered = normalize_station_observations(observations)
+    first_code, first_point = ordered[0][1], ordered[0][2][0]
+    for _, name, record in ordered[1:]:
+        if name != first_code:
+            raise ValueError(
+                "Punto {}: OBS '{}' no coincide con '{}' del punto {}. "
+                "Edite la secuencia o las observaciones antes de calcular.".format(
+                    record[0], name, first_code, first_point))
+
+
 def choose_points(records, selection):
     """Keep the supplied perimeter order, optionally selecting IDs and ranges."""
     if not selection.strip():
@@ -132,10 +274,10 @@ def prepare_perimeter(records, add_closing_segment):
     return list(records), gap
 
 
-def calculate_route(records):
-    """Analyze measured 1→N path without inventing a polygon closing leg."""
+def analyze_perimeter(records):
+    """Measure preclosure components and optional elevations for a polygon."""
     if len(records) < 2:
-        raise ValueError("Se necesitan al menos dos puntos del recorrido.")
+        raise ValueError("Se necesitan al menos dos puntos del contorno.")
     points = []
     for index, row in enumerate(records, 1):
         try:
@@ -146,54 +288,27 @@ def calculate_route(records):
         if not all(math.isfinite(value) for value in (n, e) + (() if z is None else (z,))):
             raise ValueError("Punto {}: valor no finito.".format(index))
         points.append((str(row[0]), n, e, z))
-    segments = []
+    distances = []
+    slope_distances = []
     for a, b in zip(points, points[1:]):
-        dn, de = b[1] - a[1], b[2] - a[2]
-        horizontal = math.hypot(dn, de)
+        horizontal = math.hypot(b[1] - a[1], b[2] - a[2])
         if horizontal <= 1e-10:
             raise ValueError("Tramo {}-{}: distancia horizontal cero.".format(a[0], b[0]))
-        dz = b[3] - a[3] if a[3] is not None and b[3] is not None else None
-        slope = math.hypot(horizontal, dz) if dz is not None else None
-        segments.append((a[0], b[0], a[1], a[2], b[1], b[2],
-                         dn, de, horizontal, _bearing(dn, de),
-                         a[3], b[3], dz, slope))
-    crossings = []
-    xy = [(p[2], p[1]) for p in points]
-    for i in range(len(segments)):
-        for j in range(i + 2, len(segments)):
-            if _intersects(xy[i], xy[i + 1], xy[j], xy[j + 1]):
-                crossings.append((segments[i][0] + "-" + segments[i][1],
-                                  segments[j][0] + "-" + segments[j][1]))
-    horizontal_total = math.fsum(s[8] for s in segments)
-    closure_dn = points[-1][1] - points[0][1]
-    closure_de = points[-1][2] - points[0][2]
-    closure_error = math.hypot(closure_dn, closure_de)
-    return segments, {
-        "horizontal": horizontal_total,
-        "slope": math.fsum(s[13] for s in segments) if all(s[13] is not None for s in segments) else None,
-        "gap": closure_error,
-        "relative_error": closure_error / horizontal_total,
-        "closure_dn": closure_dn,
-        "closure_de": closure_de,
-        "closure_ratio": horizontal_total / closure_error if closure_error else math.inf,
+        distances.append(horizontal)
+        if a[3] is not None and b[3] is not None:
+            slope_distances.append(math.hypot(horizontal, b[3] - a[3]))
+    dn = points[-1][1] - points[0][1]
+    de = points[-1][2] - points[0][2]
+    elevations = [point[3] for point in points if point[3] is not None]
+    return {
+        "horizontal": math.fsum(distances),
+        "slope": math.fsum(slope_distances) if len(slope_distances) == len(distances) else None,
+        "gap": math.hypot(dn, de), "closure_dn": dn, "closure_de": de,
         "net_dz": points[-1][3] - points[0][3]
         if points[0][3] is not None and points[-1][3] is not None else None,
-        "min_z": min((p[3] for p in points if p[3] is not None), default=None),
-        "max_z": max((p[3] for p in points if p[3] is not None), default=None),
-        "crossings": crossings,
+        "min_z": min(elevations, default=None),
+        "max_z": max(elevations, default=None),
     }
-
-
-def evaluate_closure(summary, same_control_point, max_error_m, min_ratio):
-    """Apply user-selected survey closure criteria, not polygon topology checks."""
-    if not same_control_point:
-        return "NO EVALUADO"
-    if max_error_m <= 0 or min_ratio <= 0:
-        raise ValueError("Los límites de cierre deben ser positivos.")
-    if (summary["gap"] > max_error_m
-            or summary["closure_ratio"] < min_ratio):
-        return "NO CUMPLE"
-    return "CUMPLE"
 
 
 def _bearing(dn, de):
@@ -324,12 +439,10 @@ def calculate(records):
     return segments, perimeter, summary
 
 
-def _polygon_svg(segments, area=None, closed=True, point_ids=None):
+def _polygon_svg(segments, area):
     """Plano independiente, escalado en proporción a metros UTM."""
-    points = [(segment[4], segment[3]) for segment in segments] if closed else (
-        [(s[3], s[2]) for s in segments] + [(segments[-1][5], segments[-1][4])])
-    if point_ids is None:
-        point_ids = [str(i) for i in range(1, len(points) + 1)]
+    points = [(segment[4], segment[3]) for segment in segments]
+    point_ids = [str(i) for i in range(1, len(points) + 1)]
     east = [p[0] for p in points]
     north = [p[1] for p in points]
     min_e, max_e = min(east), max(east)
@@ -397,13 +510,10 @@ def _polygon_svg(segments, area=None, closed=True, point_ids=None):
                      'text-anchor="end">{:.1f}</text>'.format(
                          left - 9, y + 4, min_n + span_n * fraction))
     shape = ('<polygon points="{}" fill="#32b7ad" fill-opacity=".18" '
-             'stroke="#087f83" stroke-width="3" stroke-linejoin="round"/>'.format(path)
-             if closed else '<polyline points="{}" fill="none" stroke="#087f83" '
-             'stroke-width="3" stroke-linejoin="round"/>'.format(path))
+             'stroke="#087f83" stroke-width="3" stroke-linejoin="round"/>'.format(path))
     area_label = ('<g class="area-label"><rect x="330" y="10" width="240" '
                   'height="28" rx="7"/><text x="450" y="29" '
-                  'text-anchor="middle">Área: {:,.3f} m²</text></g>'.format(area)
-                  if area is not None else "")
+                  'text-anchor="middle">Área: {:,.3f} m²</text></g>'.format(area))
     return ('<svg viewBox="0 0 900 560" role="img" '
             'aria-label="Plano del polígono con puntos numerados y ejes UTM">'
             '<rect x="0" y="0" width="900" height="560" fill="#f8fbfd"/>'
@@ -416,17 +526,16 @@ def _polygon_svg(segments, area=None, closed=True, point_ids=None):
                              "".join(labels), area_label)
 
 
-def _delivery_table(segments, route=False):
+def _delivery_table(segments, filename="estaciones_distancias_rumbos.csv"):
     """Provide an exact three-column CSV and its matching HTML table."""
     buffer = io.StringIO(newline="")
     writer = csv.writer(buffer, lineterminator="\r\n")
     writer.writerow(("ESTACION", "DISTANCIA", "RUMBOS"))
     rows = []
     for segment in segments:
-        station = ("{}-{}".format(segment[0], segment[1])
-                   if route else segment[0])
-        distance = segment[8] if route else segment[9]
-        bearing = segment[9] if route else segment[10]
+        station = segment[0]
+        distance = segment[9]
+        bearing = segment[10]
         distance_text = "{:.3f}".format(distance)
         writer.writerow((station, distance_text, bearing))
         rows.append('<tr><td>{}</td><td class="num">{}</td><td>{}</td></tr>'.format(
@@ -434,18 +543,19 @@ def _delivery_table(segments, route=False):
     data = b"\xef\xbb\xbf" + buffer.getvalue().encode("utf-8")
     uri = "data:text/csv;charset=utf-8;base64," + base64.b64encode(data).decode("ascii")
     return ('<section><h2>Tabla para entrega</h2>'
-            '<p><a class="download" download="estaciones_distancias_rumbos.csv" '
+            '<p><a class="download" download="{}" '
             'href="{}">Descargar CSV</a></p>'
             '<div style="overflow-x:auto"><table><thead><tr><th>ESTACION</th>'
             '<th>DISTANCIA</th><th>RUMBOS</th></tr></thead><tbody>{}</tbody></table></div>'
             '<small>Distancias horizontales en metros a tres decimales; rumbos al segundo. '
             'Al abrir el CSV en Excel, importe ESTACION como texto para evitar '
-            'conversiones automáticas a fecha.</small></section>').format(uri, "".join(rows))
+            'conversiones automáticas a fecha.</small></section>').format(
+                html.escape(filename, quote=True), uri, "".join(rows))
 
 
 def build_html(segments, perimeter, summary, layer, crs, author="",
                closing_gap=0.0, added_close=False,
-               pre_summary=None, full_summary=None):
+               pre_summary=None, full_summary=None, delivery_filename=None):
     def esc(value):
         return html.escape(str(value), quote=True)
 
@@ -468,7 +578,8 @@ def build_html(segments, perimeter, summary, layer, crs, author="",
                             else "{:+,.3f}".format(area_difference))
     author_html = "<span>Autor: {}</span>".format(esc(author.strip())) if author.strip() else ""
     chart = _polygon_svg(segments, summary["corrected_area"])
-    delivery_table = _delivery_table(segments)
+    delivery_table = _delivery_table(
+        segments, filename=delivery_filename or "estaciones_distancias_rumbos.csv")
     close_notice = (
         '<div class="notice">Se repitió internamente la primera coordenada para '
         'formar el lado final {} de {:.3f} m. Este lado permite calcular el área; '
@@ -605,142 +716,61 @@ El error mostrado procede de ese redondeo; las coordenadas UTM de entrada ya cie
                   precision=precision, rows="".join(rows))
 
 
-def build_route_html(segments, summary, source, crs, author="",
-                     same_control_point=True, max_error_m=0.05,
-                     min_ratio=5000):
-    """Report an observed path, keeping vertical data and topology visible."""
-    def esc(value):
-        return html.escape(str(value), quote=True)
+def analyze_station_groups(groups):
+    """Analyze each observed perimeter without connecting different groups."""
+    polygons = []
+    for name, records in groups.items():
+        pre_summary = analyze_perimeter(records)
+        closed, gap = prepare_perimeter(records, True)
+        try:
+            segments, perimeter, summary = calculate(closed)
+        except ValueError as exc:
+            raise ValueError("Polígono {}: {}".format(name, exc))
+        full_summary = analyze_perimeter(closed)
+        polygons.append((name, records, segments, perimeter, summary,
+                         gap, pre_summary, full_summary))
+    return polygons
 
-    def fmt(value):
-        return "{:,.3f}".format(value) if value is not None else "—"
-    points = [segment[0] for segment in segments] + [segments[-1][1]]
-    plot = _polygon_svg(segments, closed=False, point_ids=points)
-    delivery_table = _delivery_table(segments, route=True)
-    crossing_text = (
-        "{} pares de tramos se cruzan o tocan en planta (por ejemplo, {} y {}).".format(
-            len(summary["crossings"]), *summary["crossings"][0])
-        if summary["crossings"] else "No se detectaron cruces entre tramos no contiguos.")
-    ratio = ("∞ (cierre exacto)" if math.isinf(summary["closure_ratio"])
-             else "1:{:,.2f}".format(summary["closure_ratio"]))
-    closure_title = ("Error de cierre" if same_control_point
-                     else "Separación entre extremos")
-    closure_note = (
-        "Esta relación solo tiene sentido si el último punto es una nueva observación "
-        "del mismo punto de control inicial; compruebe esa identidad antes de calificar el cierre."
-        if same_control_point else
-        "Los extremos no se identificaron como el mismo punto de control; "
-        "su separación no es un error de cierre topográfico.")
-    ratio_html = ('<div class="card">Precisión <b>{}</b></div>'.format(ratio)
-                  if same_control_point else "")
-    relative_html = ('<div class="card">Error relativo <b>{:.13f}</b></div>'.format(
-        summary["relative_error"]) if same_control_point else "")
-    status = evaluate_closure(summary, same_control_point, max_error_m, min_ratio)
-    if status == "NO CUMPLE":
-        status_html = (
-            '<div class="status failed"><strong>NO CUMPLE EL CRITERIO DE CIERRE</strong>'
-            '<p>Error observado: {gap:,.3f} m (máximo configurado: '
-            '{max_error:.3f} m). Precisión: 1:{ratio:,.2f} '
-            '(mínima configurada: 1:{minimum:,}). Revise las observaciones '
-            'y el punto de control antes de aceptar el levantamiento.</p></div>').format(
-                gap=summary["gap"], max_error=max_error_m,
-                ratio=summary["closure_ratio"], minimum=min_ratio)
-    elif status == "CUMPLE":
-        status_html = (
-            '<div class="status passed"><strong>CUMPLE EL CRITERIO CONFIGURADO</strong>'
-            '<p>Error máximo: {max_error:.3f} m; precisión mínima: '
-            '1:{minimum:,}. Verifique además el recorrido y las observaciones '
-            'de campo.</p></div>').format(max_error=max_error_m,
-                                          minimum=min_ratio)
-    else:
-        status_html = (
-            '<div class="status unevaluated"><strong>CIERRE NO EVALUADO</strong>'
-            '<p>El último punto no se indicó como una reobservación del control '
-            'inicial. La separación entre extremos no es un error de cierre.</p></div>')
-    rows = []
-    for s in segments:
-        rows.append("<tr><td>{}-{}</td>".format(esc(s[0]), esc(s[1]))
-                    + "".join('<td class="num">{}</td>'.format(fmt(v)) for v in
-                              (s[2], s[3], s[10], s[4], s[5], s[11],
-                               s[12], s[8], s[13]))
-                    + "<td>{}</td></tr>".format(esc(s[9])))
-    author_text = "<span>Autor: {}</span>".format(esc(author.strip())) if author.strip() else ""
-    return """<!doctype html><html lang="es"><meta charset="utf-8">
-<title>Recorrido de estación total</title><style>
-body{{font:15px system-ui,Arial;margin:0;background:#f2f6f9;color:#183348}}
-main{{max-width:1180px;margin:2rem auto;padding:0 1.25rem 2rem}}
-header{{background:#163b57;color:white;padding:1.5rem 2rem;border-radius:12px}}
-h1{{margin:.2rem 0}}h2{{color:#163b57}}.meta{{display:flex;gap:1.5rem;flex-wrap:wrap}}
-.summary{{display:flex;gap:1rem;flex-wrap:wrap;margin:1.2rem 0}}
-.card{{background:white;border-left:4px solid #19a99d;padding:1rem;flex:1;
- min-width:170px;border-radius:8px}}.card b{{display:block;color:#087f83;font-size:1.2rem}}
-.notice{{background:#fff6e3;border-left:4px solid #ce8f23;padding:1rem;
- margin:1rem 0;border-radius:5px}}
-.status{{padding:1rem 1.2rem;margin:1rem 0;border-radius:6px;line-height:1.5}}
-.status p{{margin:.35rem 0 0}}.failed{{background:#fff0ee;border:2px solid #b32626;color:#822020}}
-.passed{{background:#e8f6ee;border:2px solid #318254;color:#205c3b}}
-.unevaluated{{background:#eef3f6;border:2px solid #728896;color:#304c5b}}
-section{{background:white;padding:1.35rem;margin-top:1.2rem;border-radius:10px}}
-.chart{{overflow:auto;text-align:center}}svg{{width:100%;max-width:900px;height:auto;
- border:1px solid #dce8ed;border-radius:8px}}
-svg .grid{{stroke:#dfeaf0;stroke-width:1}}svg .axis{{fill:#31566b;font:bold 14px system-ui}}
-svg .tick{{fill:#567186;font:11px system-ui}}
-svg .vertex circle{{fill:#0b6675;stroke:white;stroke-width:1.5}}
-svg .point-label{{fill:#173c54;font:bold 12px system-ui;paint-order:stroke;
- stroke:white;stroke-width:3px;stroke-linejoin:round}}
-table{{border-collapse:collapse;width:100%}}th,td{{border:1px solid #ccd9df;
- padding:.5rem;text-align:center;white-space:nowrap}}
-th{{background:#163b57;color:white;text-align:center;vertical-align:middle}}
-tr:nth-child(even){{background:#f5f8fa}}.num{{text-align:center;font-variant-numeric:tabular-nums}}
-small{{display:block;margin-top:1rem;line-height:1.5}}
-.download{{display:inline-block;background:#087f83;color:white;text-decoration:none;
- padding:.7rem 1.1rem;border-radius:6px;font-weight:bold}}
-.download:hover{{background:#096b73}}
-@media print{{body{{background:white}}main{{margin:0;max-width:none}}}}
-</style><main><header><h1>Recorrido de estación total</h1>
-<div class="meta"><span>Archivo: {source}</span><span>CRS: {crs}</span>{author}</div></header>
-<div class="summary"><div class="card">Puntos <b>{count}</b></div>
-<div class="card">Distancia horizontal recorrida <b>{horizontal} m</b></div>
-<div class="card">Distancia inclinada calculada <b>{slope} m</b></div>
-<div class="card">{closure_title} <b>{gap} m</b></div>
-{relative_html}{ratio_html}</div>
-{status_html}
-<div class="notice">Recorrido en el orden registrado, del punto {first} al {last}.
-{crossing} El recorrido no se fuerza a cerrar ni se informa un área de polígono
-simple. {closure_note}</div>
-<section><h2>Componentes del cierre en planta</h2><p>ΔN (último − primero):
-<b>{closure_dn} m</b> · ΔE (último − primero): <b>{closure_de} m</b>.</p>
-<small>Distancia horizontal acumulada P = {horizontal} m; separación e =
-√(ΔN² + ΔE²) = {gap} m. Cuando ambos extremos observan el mismo control,
-la precisión se expresa 1:(P/e), sin añadir un tramo de cierre ni corregir
-las coordenadas.</small></section>
-<section><h2>Desniveles y cotas</h2><p>Cota mínima: <b>{min_z} m</b> ·
-Cota máxima: <b>{max_z} m</b> · Desnivel del primer al último punto:
-<b>{net_dz} m</b>.</p><small>Distancia inclinada por tramo =
-√(distancia horizontal² + desnivel²). Se calcula desde las cotas del CSV;
-no sustituye una distancia inclinada observada directamente por el instrumento.</small></section>
-<section><h2>Plano del recorrido</h2><div class="chart">{plot}</div>
-<small>Trazo abierto en el orden de captura, sin línea artificial entre el último y el primer punto.
-Pase el cursor sobre cada vértice para consultar el identificador y las coordenadas.</small></section>
-{delivery_table}
-<section><h2>Detalle por tramo</h2><div style="overflow-x:auto"><table><thead><tr>
-<th>Tramo</th><th>N inicial</th><th>E inicial</th><th>Cota inicial</th>
-<th>N final</th><th>E final</th><th>Cota final</th><th>Δ cota</th>
-<th>Distancia horizontal</th><th>Distancia inclinada calculada</th><th>Rumbo</th>
-</tr></thead><tbody>{rows}</tbody></table></div></section></main></html>""".format(
-        source=esc(source), crs=esc(crs), author=author_text,
-        count=len(segments) + 1, horizontal=fmt(summary["horizontal"]),
-        slope=fmt(summary["slope"]), gap=fmt(summary["gap"]),
-        closure_title=esc(closure_title), ratio_html=ratio_html,
-        relative_html=relative_html,
-        status_html=status_html,
-        closure_note=esc(closure_note),
-        closure_dn="{:+,.3f}".format(summary["closure_dn"]),
-        closure_de="{:+,.3f}".format(summary["closure_de"]),
-        first=esc(points[0]), last=esc(points[-1]),
-        crossing=esc(crossing_text), min_z=fmt(summary["min_z"]),
-        max_z=fmt(summary["max_z"]), net_dz=fmt(summary["net_dz"]),
-        plot=plot, delivery_table=delivery_table, rows="".join(rows))
+
+def build_multi_html(polygons, source, crs, author=""):
+    """Present independent polygon reports in one HTML file."""
+    sections = []
+    stylesheet = None
+    for name, records, segments, perimeter, summary, gap, pre, full in polygons:
+        single = build_html(
+            segments, perimeter, summary, "{} · {}".format(source, name),
+            crs, author, gap, gap > 1e-8, pre, full,
+            "estaciones_{}_distancias_rumbos.csv".format(name))
+        if stylesheet is None:
+            stylesheet = single.split("<style>", 1)[1].split("</style>", 1)[0]
+        content = single.split("<main>", 1)[1].rsplit("</main>", 1)[0]
+        sections.append(
+            '<article id="poligono-{}"><h2>Polígono {} · {} puntos</h2>{}</article>'.format(
+                html.escape(name, quote=True), html.escape(name), len(records), content))
+    total = math.fsum(item[4]["raw_area"] for item in polygons)
+    navigation = " · ".join(
+        '<a href="#poligono-{0}">{0}</a>'.format(html.escape(item[0], quote=True))
+        for item in polygons)
+    intro = (
+        '<header><h1>Finca: varios polígonos</h1><div class="meta">'
+        '<span>Archivo: {}</span><span>CRS: {}</span>{}</div></header>'
+        '<section><h2>Resumen de contornos</h2><p>{} polígonos: {}.</p>'
+        '<p>Suma aritmética de áreas UTM originales: <b>{:,.3f} m²</b>. '
+        'La suma representa el área conjunta solo cuando los contornos no se superponen.</p>'
+        '<small>Los puntos se ordenan por el número de punto del instrumento '
+        'o por OBS numérico en el formato anterior. El código PT/PC identifica '
+        'cada contorno. '
+        'Se excluyen los traslados entre grupos. El lado final añadido une el '
+        'último vértice con el primero de cada contorno y no constituye una '
+        'reobservación de cierre topográfico.</small></section>').format(
+            html.escape(source), html.escape(crs),
+            '<span>Autor: {}</span>'.format(html.escape(author.strip()))
+            if author.strip() else "", len(polygons), navigation, total)
+    return ('<!doctype html><html lang="es"><meta charset="utf-8">'
+            '<title>Cierre geométrico · varios polígonos</title><style>{}'
+            'article{{margin-top:2.4rem}}article>h2{{padding:1rem;color:#087f83}}'
+            '</style><main>{}{}</main></html>').format(
+                stylesheet, intro, "".join(sections))
 
 
 class CierreGeometrico:
@@ -766,16 +796,16 @@ class CierreGeometrico:
         dialog.setStyleSheet("""
             QDialog { background: #f1f6f8; color: #173b52; font-size: 13px; }
             QLabel#heading { background: #163b57; color: white; font-size: 19px;
-                             font-weight: bold; padding: 17px; border-radius: 8px; }
+                             font-weight: bold; padding: 11px; border-radius: 8px; }
             QLabel#help { color: #4c6879; padding: 5px 3px; }
             QGroupBox { background: white; border: 1px solid #d7e4ea;
-                        border-radius: 8px; margin-top: 15px; padding: 15px 12px 9px;
+                        border-radius: 8px; margin-top: 10px; padding: 8px 10px 6px;
                         font-weight: bold; }
             QGroupBox::title { subcontrol-origin: margin; left: 12px;
                                padding: 0 6px; color: #087f83; }
             QComboBox, QLineEdit { background: white; color: #173b52;
                 border: 1px solid #b9ced9; border-radius: 5px;
-                padding: 7px; min-height: 22px; }
+                padding: 5px; min-height: 20px; }
             QComboBox:focus, QLineEdit:focus { border: 2px solid #19a99d; }
             QPushButton { background: #e3ebef; color: #163b57; border: 0;
                           border-radius: 6px; padding: 9px 17px; font-weight: bold; }
@@ -789,7 +819,7 @@ class CierreGeometrico:
             QTabBar::tab:selected { background: #087f83; color: white; }
         """)
         layout = QVBoxLayout(dialog)
-        layout.setSpacing(7)
+        layout.setSpacing(5)
         layout.setContentsMargins(10, 10, 10, 10)
         heading = QLabel("CIERRE GEOMÉTRICO  ·  COORDENADAS UTM")
         heading.setObjectName("heading")
@@ -812,8 +842,8 @@ class CierreGeometrico:
             page.setMinimumHeight(180)
             content = QWidget(page)
             content_layout = QVBoxLayout(content)
-            content_layout.setContentsMargins(8, 8, 12, 8)
-            content_layout.setSpacing(7)
+            content_layout.setContentsMargins(6, 5, 9, 5)
+            content_layout.setSpacing(5)
             page.setWidget(content)
             tabs.addTab(page, title)
             return content_layout
@@ -822,6 +852,7 @@ class CierreGeometrico:
         analysis_layout = add_tab("Análisis y cierre")
         inputs = QGroupBox("Datos de entrada")
         form = QFormLayout()
+        form.setVerticalSpacing(4)
         inputs.setLayout(form)
         data_layout.addWidget(inputs)
         source_box = QComboBox()
@@ -829,37 +860,15 @@ class CierreGeometrico:
         source_box.addItem("CSV directo de estación total", "station_csv")
         form.addRow("Origen", source_box)
         mode_box = QComboBox()
-        mode_box.addItem("Automático: polígono si el contorno es válido", "auto")
-        mode_box.addItem("Recorrido de estación total (1 → N)", "route")
         mode_box.addItem("Polígono cerrado y cálculo de área", "polygon")
-        mode_box.setCurrentIndex(0)
+        mode_box.addItem("Varios polígonos por grupo PT/PC", "multi")
         analysis_group = QGroupBox("Configuración del análisis")
         analysis_form = QFormLayout(analysis_group)
+        analysis_form.setVerticalSpacing(4)
         analysis_layout.addWidget(analysis_group)
         analysis_form.addRow("Tipo de informe", mode_box)
-        same_point_box = QCheckBox(
-            "El último punto reobserva el mismo control que el primero")
-        same_point_box.setChecked(True)
-        analysis_form.addRow("Evaluar cierre", same_point_box)
-        max_error_box = QDoubleSpinBox()
-        max_error_box.setDecimals(3)
-        max_error_box.setRange(0.001, 1000.0)
-        max_error_box.setSingleStep(0.01)
-        max_error_box.setSuffix(" m")
-        max_error_box.setValue(0.05)
-        analysis_form.addRow("Error máximo permitido", max_error_box)
-        precision_box = QSpinBox()
-        precision_box.setRange(1, 1000000000)
-        precision_box.setValue(5000)
-        precision_box.setPrefix("1:")
-        analysis_form.addRow("Precisión mínima", precision_box)
-        criterion_note = QLabel(
-            "Límites iniciales editables para evaluar el cierre observado; "
-            "ajústalos al criterio técnico aplicable a tu trabajo.")
-        criterion_note.setWordWrap(True)
-        analysis_form.addRow("", criterion_note)
         csv_path_box = QLineEdit()
-        csv_path_box.setPlaceholderText("Punto, Este, Norte, Cota (sin encabezado)")
+        csv_path_box.setPlaceholderText("Punto, Este, Norte, Cota, Grupo (PT/PC)")
         csv_browse = QPushButton("Examinar…")
         csv_row = QHBoxLayout()
         csv_row.addWidget(csv_path_box)
@@ -900,8 +909,9 @@ class CierreGeometrico:
         closure_help.setWordWrap(True)
         analysis_form.addRow("Cierre", closure_help)
         sequence_help = QLabel(
-            "El CSV directo usa punto, Este, Norte, cota (opcional). "
-            "Seleccione únicamente los puntos del contorno y en su orden real. "
+            "Un polígono admite un solo patrón en OBS. Para varios polígonos, "
+            "use bloques PT/PC sin códigos ajenos. Si aparece VERT o DET "
+            "entre los puntos, edite la tabla antes de calcular. "
             "No se calcula área si el trazado se cruza.")
         sequence_help.setWordWrap(True)
         sequence_help.setObjectName("help")
@@ -909,28 +919,19 @@ class CierreGeometrico:
 
         def update_source():
             direct = source_box.currentData() == "station_csv"
-            mode_box.setCurrentIndex(0)
             csv_path_box.setEnabled(direct)
             csv_browse.setEnabled(direct)
             for box in (layer_box, north_box, east_box, elevation_box, order_box):
                 box.setEnabled(not direct)
 
         def update_mode():
-            same_point_box.setEnabled(mode_box.currentData() in ("route", "auto"))
-
-        def update_criteria():
-            active = (mode_box.currentData() in ("route", "auto")
-                      and same_point_box.isChecked())
-            max_error_box.setEnabled(active)
-            precision_box.setEnabled(active)
+            multiple = mode_box.currentData() == "multi"
+            sequence_box.setEnabled(not multiple)
 
         source_box.currentIndexChanged.connect(update_source)
         mode_box.currentIndexChanged.connect(update_mode)
-        mode_box.currentIndexChanged.connect(update_criteria)
-        same_point_box.toggled.connect(update_criteria)
         update_source()
         update_mode()
-        update_criteria()
         data_layout.addStretch()
         analysis_layout.addStretch()
 
@@ -955,6 +956,17 @@ class CierreGeometrico:
             for index, name in enumerate(names):
                 if name.upper() in ("COTA", "ELEVACION", "ALTURA", "Z"):
                     elevation_box.setCurrentIndex(index + 1)
+                    break
+            for index, name in enumerate(names):
+                if name.upper().strip() == "OBS":
+                    first_feature = next(selected.getFeatures(), None)
+                    if first_feature is not None:
+                        try:
+                            float(first_feature[name])
+                        except (ValueError, TypeError):
+                            pass  # OBS can contain PT/PC in instrument exports.
+                        else:
+                            order_box.setCurrentIndex(index + 1)
                     break
             index = crs_box.findData(selected.crs().authid())
             if index >= 0:
@@ -984,6 +996,7 @@ class CierreGeometrico:
             crs = QgsCoordinateReferenceSystem(crs_box.currentData())
             records = []
             try:
+                selected_mode = mode_box.currentData()
                 direct = source_box.currentData() == "station_csv"
                 if direct:
                     csv_path = csv_path_box.text().strip()
@@ -991,48 +1004,71 @@ class CierreGeometrico:
                         raise ValueError("Seleccione el CSV de la estación total.")
                     records = read_station_csv(csv_path)
                     source_name = os.path.basename(csv_path)
+                    if selected_mode == "multi":
+                        observations = read_station_observations(csv_path)
+                    else:
+                        validate_code_interpretation(
+                            read_station_observations(csv_path, allow_missing=True))
                 else:
                     layer = QgsProject.instance().mapLayer(layer_box.currentData())
                     if layer is None:
                         raise ValueError("Seleccione una tabla cargada en QGIS.")
                     if north_box.currentData() == east_box.currentData():
                         raise ValueError("Norte y Este deben ser campos distintos.")
-                    for feature in layer.getFeatures():
-                        order = feature[order_box.currentData()] if order_box.currentData() else len(records)
+                    fields = {field.name().upper().strip(): field.name()
+                              for field in layer.fields()}
+                    if selected_mode == "multi":
+                        if "PUNTO" not in fields or "OBS" not in fields:
+                            raise ValueError("La tabla necesita los campos PUNTO y OBS "
+                                             "para varios polígonos.")
+                    if "PUNTO" in fields and "OBS" in fields:
+                        observations = []
+                        for feature in layer.getFeatures():
+                            observations.append((
+                                feature[fields["OBS"]], feature[fields["PUNTO"]],
+                                feature[north_box.currentData()],
+                                feature[east_box.currentData()],
+                                feature[elevation_box.currentData()]
+                                if elevation_box.currentData() else None,
+                                "Registro {}".format(feature.id())))
+                        if selected_mode == "polygon":
+                            validate_code_interpretation(observations)
+                    if selected_mode == "polygon":
+                        for feature in layer.getFeatures():
+                            order = (feature[order_box.currentData()]
+                                     if order_box.currentData() else len(records))
+                            if order_box.currentData():
+                                try:
+                                    order = float(order)
+                                except (ValueError, TypeError):
+                                    raise ValueError(
+                                        "El campo de orden debe ser numérico. "
+                                        "Use PUNTO numérico u OBS numérico; "
+                                        "PT/PC identifica el grupo.")
+                                if not math.isfinite(order):
+                                    raise ValueError("El campo de orden contiene valores no finitos.")
+                            records.append((str(feature.id()), feature[north_box.currentData()],
+                                            feature[east_box.currentData()],
+                                            feature[elevation_box.currentData()]
+                                            if elevation_box.currentData() else None, order))
                         if order_box.currentData():
-                            order = float(order)
-                            if not math.isfinite(order):
-                                raise ValueError("El campo de orden contiene valores no finitos.")
-                        records.append((str(feature.id()), feature[north_box.currentData()],
-                                        feature[east_box.currentData()],
-                                        feature[elevation_box.currentData()]
-                                        if elevation_box.currentData() else None, order))
-                    if order_box.currentData():
-                        orders = [item[4] for item in records]
-                        if len(orders) != len(set(orders)):
-                            raise ValueError("El campo de orden contiene duplicados.")
-                        records.sort(key=lambda item: item[4])
-                    records = [row[:4] for row in records]
+                            orders = [item[4] for item in records]
+                            if len(orders) != len(set(orders)):
+                                raise ValueError("El campo de orden contiene duplicados.")
+                            records.sort(key=lambda item: item[4])
+                        records = [row[:4] for row in records]
                     source_name = layer.name()
-                if sequence_box.text().strip():
-                    records = choose_points(records, sequence_box.text())
-                selected_mode = mode_box.currentData()
-                route_mode = selected_mode == "route"
-                if not route_mode:
-                    pre_segments, pre_summary = calculate_route(records)
+                if selected_mode == "multi":
+                    polygons = analyze_station_groups(
+                        group_station_observations(observations))
+                else:
+                    if sequence_box.text().strip():
+                        records = choose_points(records, sequence_box.text())
+                    pre_summary = analyze_perimeter(records)
                     closed_records, closing_gap = prepare_perimeter(records, True)
                     added_close = closing_gap > 1e-8
-                    try:
-                        segments, perimeter, summary = calculate(closed_records)
-                    except ValueError as exc:
-                        if selected_mode == "auto" and "se cruzan o se tocan" in str(exc):
-                            route_mode = True
-                        else:
-                            raise
-                    if not route_mode:
-                        full_segments, full_summary = calculate_route(closed_records)
-                if route_mode:
-                    segments, summary = calculate_route(records)
+                    segments, perimeter, summary = calculate(closed_records)
+                    full_summary = analyze_perimeter(closed_records)
             except (ValueError, TypeError, OSError) as exc:
                 QMessageBox.warning(dialog, "Datos inválidos", str(exc))
                 return
@@ -1044,12 +1080,9 @@ class CierreGeometrico:
                 path += ".html"
             try:
                 with open(path, "w", encoding="utf-8") as report:
-                    if route_mode:
-                        report.write(build_route_html(segments, summary, source_name,
-                                                      crs.authid(), author_box.text(),
-                                                      same_point_box.isChecked(),
-                                                      max_error_box.value(),
-                                                      precision_box.value()))
+                    if selected_mode == "multi":
+                        report.write(build_multi_html(
+                            polygons, source_name, crs.authid(), author_box.text()))
                     else:
                         report.write(build_html(segments, perimeter, summary,
                                                 source_name, crs.authid(), author_box.text(),
@@ -1059,15 +1092,7 @@ class CierreGeometrico:
                 QMessageBox.critical(dialog, "Error de escritura", str(exc))
                 return
             webbrowser.open("file://" + os.path.abspath(path))
-            if route_mode and evaluate_closure(
-                    summary, same_point_box.isChecked(),
-                    max_error_box.value(), precision_box.value()) == "NO CUMPLE":
-                QMessageBox.warning(
-                    dialog, "Cierre no aceptable",
-                    "El recorrido no cumple los límites de cierre configurados. "
-                    "Revise la advertencia en el informe HTML.\n\n" + path)
-            else:
-                QMessageBox.information(dialog, "Informe generado", path)
+            QMessageBox.information(dialog, "Informe generado", path)
 
         generate.clicked.connect(generate_report)
         dialog.exec_()

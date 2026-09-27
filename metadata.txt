@@ -1,11 +1,11 @@
 [general]
 name=Cierre geométrico
 qgisMinimumVersion=3.22
-description=Analyzes ordered UTM coordinates and creates an HTML report of bearings, distances, closure, elevations and polygon area.
+description=Calculates bearings, distances, closure and area for one or multiple UTM polygons with observation code validation and an HTML report.
 version=1.0.0
 author=Raúl Víquez
 email=viquezr@gmail.com
-about=Reads a QGIS coordinate table or total station CSV, validates the ordered route or polygon, and exports a topographic HTML report with an SVG drawing and downloadable CSV.
+about=Reads a QGIS coordinate table or total station CSV, validates polygon boundaries and PT/PC observation patterns, and exports an HTML report with drawings and downloadable CSV tables. Mixed codes such as VERT and DET stop the calculation until the input is corrected.
 category=Vector
 icon=icon.svg
 homepage=https://viquezr-dev.github.io/Cierre_geometrico/
