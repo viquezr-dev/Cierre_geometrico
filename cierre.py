@@ -1092,7 +1092,7 @@ this.parentElement.querySelector('output').textContent=Math.round(z)+'%'"><outpu
                    '<meta name="viewport" content="width=device-width, initial-scale=1">'
                    '<title>Cierre observado de poligonal</title>'
                    '<style>{style}</style><main><header><h1>📐 Cierre observado de poligonal</h1>'
-                   '<p>Desarrollado por: Raúl Víquez | viquezr@gmail.com</p><p>Archivo: {source} · CRS: {crs} · '
+                   '<p>Archivo: {source} · CRS: {crs} · '
                    'Autor: {author}</p></header>{warnings}'
                    '<section><h2>Control y convención de entrada</h2>{control}'
                    '<p>ANGULO es el ángulo interior en grados decimales de la estación. DISTANCIA es horizontal '
@@ -1591,7 +1591,7 @@ small{{display:block;margin-top:1rem;line-height:1.5;color:#617d92}}
  .chart svg{{width:100%!important}}
  section,.card{{box-shadow:none;border:1px solid #d8e6f0}}}}
 </style><main><header><h1>📐 Cierre geométrico de polígono</h1>
-<div class="developer">Desarrollado por: Raúl Víquez | viquezr@gmail.com</div>
+
 <div class="meta"><span>Tabla: {layer}</span><span>CRS: {crs}</span>{author}</div></header><div class="summary">
 <div class="card">Tramos: <b>{count}</b></div>
 <div class="card">Perímetro: <b>{perimeter} m</b></div>
@@ -1705,7 +1705,7 @@ def build_multi_html(polygons, source, crs, author=""):
         for item in polygons)
     intro = (
         '<header><h1>📐 Finca: varios polígonos</h1>'
-        '<div class="developer">Desarrollado por: Raúl Víquez | viquezr@gmail.com</div>'
+        ''
         '<div class="meta">'
         '<span>Archivo: {}</span><span>CRS: {}</span>{}</div></header>'
         '<section><h2>Resumen de contornos</h2><p>{} polígonos: {}.</p>'
